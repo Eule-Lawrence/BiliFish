@@ -35,6 +35,8 @@ from platform_utils import (
 from risk import describe
 from runner import Runner
 from storage import StateStore
+import memes
+import presets
 import themes as theme_mod
 
 log = logging.getLogger(__name__)
@@ -583,6 +585,10 @@ class App(tk.Tk):
         ttk.Entry(cell_kw, textvariable=var("search_keyword"), width=16).pack(anchor="w")
         ttk.Label(cell_kw, text="空着就用上面的来源", foreground="#999", font=FONT_SMALL).pack(anchor="w")
 
+        # 预制评论 / 表情包：都按「每条评论」独立掷骰子
+        num(1, 4, "预制评论概率（%）", "preset_chance", hint="0 = 不用")
+        num(1, 5, "表情包概率（%）", "meme_chance", hint="0 = 不用")
+
         # 第三行：回复时效 + 主人
         row2 = ttk.Frame(box3)
         row2.grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
@@ -655,9 +661,11 @@ class App(tk.Tk):
         s2.pack(side="right", fill="y")
         self.reply_text = t2
 
-        ttk.Label(parent, text="评论预设（可选，一行一条，只给 AI 当参考，不会照抄）", font=FONT_BIG).grid(
-            row=4, column=0, sticky="w", pady=(6, 0)
-        )
+        ttk.Label(
+            parent,
+            text="评论预设（一行一条；命中概率那一条会交给 AI 改写，不是照抄）",
+            font=FONT_BIG,
+        ).grid(row=4, column=0, sticky="w", pady=(6, 0))
         f3 = ttk.Frame(parent)
         f3.grid(row=5, column=0, sticky="nsew", pady=(4, 8))
         t3 = tk.Text(f3, wrap="word", height=4, font=FONT, undo=True)
@@ -681,7 +689,63 @@ class App(tk.Tk):
         s4.pack(side="right", fill="y")
         self.slang_text = t4
 
-        ttk.Button(parent, text="恢复默认提示词", command=self._reset_prompts).grid(row=8, column=0, sticky="w")
+        bar = ttk.Frame(parent)
+        bar.grid(row=8, column=0, sticky="ew", pady=(2, 0))
+        ttk.Button(bar, text="恢复默认提示词", command=self._reset_prompts).pack(side="left")
+        ttk.Button(bar, text="预制评论 / 表情包说明", command=self._on_extras_help).pack(side="left", padx=8)
+        ttk.Button(bar, text="打开表情包文件夹", command=self._on_open_meme_dir).pack(side="left")
+        ttk.Label(
+            bar,
+            text="预制评论可用 {owner} {up} {title} {section}",
+            foreground="#999",
+            font=FONT_SMALL,
+        ).pack(side="left", padx=12)
+
+    # ------------------------------------------------------------------
+    def _on_extras_help(self) -> None:
+        """预制评论的占位符写法 + 表情包命名规则，一次讲清楚。"""
+        found = memes.scan()
+        tags = "、".join(memes.tags(found)) or "（还没有图片）"
+        body = "\n".join(
+            [
+                presets.help_text(),
+                "",
+                "═" * 32,
+                "",
+                memes.help_text(),
+                "",
+                f"现在识别到 {len(found)} 张图，情绪：{tags}",
+            ]
+        )
+        self._show_text_dialog("预制评论 / 表情包说明", body)
+
+    def _on_open_meme_dir(self) -> None:
+        folder = memes.ensure_dir()
+        try:
+            open_path(folder)
+        except Exception as exc:
+            messagebox.showerror("打不开文件夹", f"{folder}\n\n{exc}", parent=self)
+            return
+        found = memes.scan()
+        log.info("表情包文件夹：%s（当前 %d 张，情绪：%s）", folder, len(found),
+                 "、".join(memes.tags(found)) or "无")
+
+    def _show_text_dialog(self, title: str, text: str, size: str = "780x580") -> None:
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.geometry(size)
+        win.transient(self)
+        frame = ttk.Frame(win, padding=8)
+        frame.pack(fill="both", expand=True)
+        box = tk.Text(frame, wrap="word", font=FONT, relief="flat", background="#fdfdfd")
+        sb = ttk.Scrollbar(frame, orient="vertical", command=box.yview)
+        box.configure(yscrollcommand=sb.set)
+        box.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+        ttk.Button(win, text="关闭", command=win.destroy).pack(pady=(0, 8))
+        win.focus_set()
 
     # ------------------------------------------------------------------
     def _build_log(self, parent):
@@ -791,6 +855,8 @@ class App(tk.Tk):
         cfg.max_replies_per_user = as_int("max_replies_per_user", "每人每天回复数", cfg.max_replies_per_user)
         cfg.dm_daily_limit = as_int("dm_daily_limit", "私信每日上限", cfg.dm_daily_limit)
         cfg.dm_interval_sec = as_int("dm_interval_sec", "私信检查间隔", cfg.dm_interval_sec)
+        cfg.preset_chance = as_int("preset_chance", "预制评论概率", cfg.preset_chance)
+        cfg.meme_chance = as_int("meme_chance", "表情包概率", cfg.meme_chance)
 
         cfg.comment_enabled = bool(self.v["comment_enabled"].get())
         cfg.reply_enabled = bool(self.v["reply_enabled"].get())
@@ -1233,19 +1299,47 @@ HELP_TEXT = """\
 • 开着「演练模式」时只生成、不发送；
 • 机器人正在跑的时候不能一键评论，先点「停止」。
 
-【评论预设】
+【预制评论（有概率才用）】
 
-「人设提示词」页最下面有个「评论预设」，一行一条。AI 会学它们的语气和句式，不会照抄。
-比如写：
+「人设提示词」页最下面那一栏，一行一条，每条都可以写占位符：
 
-@主人 主人这个视频是啥啥啥
+  {owner}    主人（变成真的 @昵称，对方能收到提醒，需要填「主人 UID」）
+  {up}       UP主昵称
+  {title}    视频标题
+  {section}  分区名
 
-如果你配了主人 UID，发出去时会自动把 @主人 换成真实的 @昵称（带提醒）。
+例子：
+
+  {owner}你来看看这个视频！
+  {up}这期拍得也太顶了，蹲个后续
+  {title}，我先码住慢慢看
+
+规则：
+• 每条评论都按「预制评论概率」独立掷一次骰子（在「运行参数」里改，默认 30%，0 = 不用）；
+• 命中才挑一条交给 AI —— 它只学这条的句式和语气，会结合当前视频改写成自己的话，不照抄；
+• 没命中就不把预制评论喂给 AI，让它自由发挥，避免每条评论都一个味儿；
+• {owner} 会换成真实的 @昵称并发真 @；没填「主人 UID」时降级成「我主人」；
+• 写错的占位符（比如 {name}）会原样发出去，记得只用上面四个。
+
+【表情包（带图评论）】
+
+把图片放进「meme」文件夹（点「人设提示词」页的「打开表情包文件夹」直接打开），
+文件名就是情绪标签：
+
+  meme/开心.png
+  meme/生气_2.jpg
+  meme/哈哈哈.gif
+
+• 支持 png / jpg / jpeg / webp / gif / bmp；同一个情绪放多张用「开心_1」「开心(2)」区分；
+• 每条评论按「表情包概率」独立掷骰子（默认 20%，0 = 关闭），命中就随机挑一张；
+• 图片会先传到 B站图床，再作为带图评论发出去；账号发不了图时自动退回纯文字，日志里会写原因；
+• 文件夹里没有图片时这个功能自动跳过，不影响正常评论。
 
 【私信】
 
 默认关，勾「回复私信」才会回。私信是单独一条节奏：默认 **每 60 秒**查一次，
-所以基本收到一分钟内就会回（不用等评论轮）。私信有单独的每日上限，不占评论额度。
+所以基本收到一分钟内就会回（不用等评论轮）。私信有单独的每日上限、单独计数，
+不占评论额度；不过「每日上限」整体用完时，私信也会一起停。
 
 【口语 / 网络用语】
 

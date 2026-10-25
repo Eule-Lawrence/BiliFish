@@ -74,7 +74,7 @@ class LLMClient:
         info: "VideoInfo",
         hot_comments: list[str] | None = None,
         subtitle: str | None = "",
-        presets: list[str] | None = None,
+        preset: str = "",
         slang: str = "",
     ) -> str:
         lines = [
@@ -92,10 +92,17 @@ class LLMClient:
             lines.append("")
             lines.append("字幕片段（自动生成，可能有错字，只用来理解内容）：")
             lines.append(subtitle[:600])
-        if presets:
+        if preset.strip():
             lines.append("")
-            lines.append("预设评论（学它们的语气和句式，挑一条的路子来写，别照抄；不要逐字复读）：")
-            lines.extend(f"- {p[:80]}" for p in presets[:8])
+            lines.append(
+                "预制评论参考（这次就走这条“路子”：学它的句式和语气，"
+                "结合上面的视频信息改写成一条属于这条视频的评论，不要照抄、不要逐字复读）："
+            )
+            lines.append(f"- {preset.strip()[:120]}")
+            lines.append(
+                "看到 @主人 就原样保留这三个字（程序会自动换成真正的 @ 昵称），"
+                "不要自己再写别的 @，也不要重复写人名。"
+            )
         if slang.strip():
             lines.append("")
             lines.append("口语/网络用语参考（理解意思后自然使用，别每句都塞，别用错语境）：")
@@ -104,7 +111,7 @@ class LLMClient:
         lines.append("给这个视频写一条评论吧。")
         prompt = "\n".join(lines)
         raw = await self._chat(self.cfg.system_prompt, prompt)
-        text = clean_text(raw, COMMENT_LIMIT)
+        text = clean_comment(raw, COMMENT_LIMIT)
         if not text:
             log.warning("模型返回空评论，使用兜底文案")
             text = _pick(_FALLBACK_COMMENTS)
@@ -226,6 +233,18 @@ _URL_RE = re.compile(r"https?://\S+|www\.\S+")
 _AT_RE = re.compile(r"@[^\s@]{1,20}")
 _SPACE_RE = re.compile(r"\s+")
 _OPEN_TO_CLOSE = {"（": "）", "(": ")", "【": "】", "「": "」", "《": "》"}
+
+# @主人 是预制评论里的占位记号，发出去之前由 runner 换成真实昵称。
+# 清洗时会先把这三个字换成私有区字符，否则会被 _AT_RE 当成普通 @ 删掉。
+OWNER_MARK = "@主人"
+_OWNER_HL = "\ue000OWNER\ue000"
+
+
+def clean_comment(raw: str, limit: int) -> str:
+    """评论专用清洗：保住 @主人 这个记号，其余同 clean_text。"""
+    protected = (raw or "").replace(OWNER_MARK, _OWNER_HL).replace("{owner}", _OWNER_HL)
+    text = clean_text(protected, limit)
+    return text.replace(_OWNER_HL, OWNER_MARK)
 
 
 def clean_text(raw: str, limit: int) -> str:

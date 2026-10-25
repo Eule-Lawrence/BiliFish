@@ -19,8 +19,9 @@ from typing import Any, Optional
 
 import httpx
 
-from bilibili_api import comment, homepage, hot, rank, search, session, user, video
+from bilibili_api import Picture, comment, homepage, hot, rank, search, session, user, video
 from bilibili_api.comment import CommentResourceType, OrderType
+from bilibili_api.dynamic import upload_image
 from bilibili_api.exceptions import NetworkException, ResponseCodeException
 from bilibili_api.utils.network import Api, Credential
 from bilibili_api.utils.utils import get_api
@@ -358,11 +359,16 @@ class BiliClient:
 
     # -- 发评论 --------------------------------------------------------
     async def post_comment(
-        self, info: VideoInfo, text: str, mention: Optional[tuple[str, int]] = None
+        self,
+        info: VideoInfo,
+        text: str,
+        mention: Optional[tuple[str, int]] = None,
+        picture: Optional[Path] = None,
     ) -> dict:
+        """发评论；mention 会带真 @，picture 是本地图片（作为带图评论发出去）。"""
         if not info.aid:
             raise ValueError(f"视频 {info.bvid} 缺少 aid，无法评论")
-        return await self._send(text=text, oid=info.aid, mention=mention)
+        return await self._send(text=text, oid=info.aid, mention=mention, picture=picture)
 
     async def reply(self, item: InboxItem, text: str, mention: Optional[tuple[str, int]] = None) -> dict:
         if not item.aid:
@@ -377,13 +383,15 @@ class BiliClient:
         root: Optional[int] = None,
         parent: Optional[int] = None,
         mention: Optional[tuple[str, int]] = None,
+        picture: Optional[Path] = None,
     ) -> dict:
-        """发评论。mention=(昵称, UID) 时带上真正的 @（会通知对方）。
+        """发评论。
 
-        bilibili-api 的 send_comment 没有暴露 at_name_to_mid，所以这里自己拼一次；
-        不带 @ 时还是走库里的实现，少一份维护成本。
+        mention=(昵称, UID) 时带上真正的 @（会通知对方），picture=本地图片时随评论发图。
+        bilibili-api 的 send_comment 没暴露 at_name_to_mid / pictures 的手动组装，
+        所以带 @ 或带图时这里自己拼一次请求；两者都没有时仍走库里实现，少一份维护成本。
         """
-        if mention is None:
+        if mention is None and picture is None:
             return await comment.send_comment(
                 text=text,
                 oid=oid,
@@ -392,11 +400,6 @@ class BiliClient:
                 parent=parent,
                 credential=self.credential,
             )
-
-        name, uid = mention
-        name = (name or "").strip().lstrip("@")
-        if not name or not uid:
-            return await self._send(text=text, oid=oid, root=root, parent=parent, mention=None)
 
         # 走的是自己拼的请求，把库里的两项检查补上
         self.credential.raise_for_no_sessdata()
@@ -410,14 +413,39 @@ class BiliClient:
             "plat": 1,
             "statistics": {"appId": 100, "platform": 5},
             "gaia_source": "main_web",
+        }
+
+        name, uid = mention or ("", 0)
+        name = (name or "").strip().lstrip("@")
+        if name and uid:
             # B站要求：message 里出现 @昵称，同时用这个字段把昵称映射到 mid，
             # 才会渲染成真正的艾特并给对方发通知
-            "at_name_to_mid": json.dumps({name: int(uid)}, ensure_ascii=False),
-        }
+            data["at_name_to_mid"] = json.dumps({name: int(uid)}, ensure_ascii=False)
+        if picture is not None:
+            data["pictures"] = await self._upload_picture(picture)
         if root is not None:
             data["root"] = int(root)
             data["parent"] = int(root if parent is None else parent)
         return await Api(**api, credential=self.credential).update_data(**data).result
+
+    async def _upload_picture(self, path: Path) -> str:
+        """把本地图片传到 B站图床，返回评论接口要的 pictures JSON 字符串。"""
+        pic = Picture.from_file(str(path))
+        res = await upload_image(image=pic, credential=self.credential)
+        url = str((res or {}).get("image_url") or "")
+        if not url:
+            raise ValueError("B站图床没有返回图片地址")
+        return json.dumps(
+            [
+                {
+                    "img_src": url,
+                    "img_width": _to_int((res or {}).get("image_width"), pic.width),
+                    "img_height": _to_int((res or {}).get("image_height"), pic.height),
+                    "img_size": _to_int((res or {}).get("img_size"), int(pic.size or 0)),
+                }
+            ],
+            ensure_ascii=False,
+        )
 
     # -- 消息中心 ------------------------------------------------------
     async def find_recent_comment_rpid(self, aid: int, user_mid: int, text: str = "") -> int:

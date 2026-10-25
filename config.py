@@ -17,7 +17,7 @@ from typing import Any
 
 APP_NAME = "BiliFish"
 APP_TITLE = "大肥鱼 · B站 AI 自动评论"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # 默认提示词（界面上可以改，改完保存在 config.json 里）
@@ -146,9 +146,11 @@ class Config:
     system_prompt: str = DEFAULT_SYSTEM_PROMPT
     reply_prompt: str = DEFAULT_REPLY_PROMPT
     dm_prompt: str = DEFAULT_DM_PROMPT
-    comment_presets: str = ""       # 预设评论，一行一条，给 AI 参考
+    comment_presets: str = ""       # 预制评论，一行一条，可写 {owner}/{up}/{title}/{section}
     slang_notes: str = ""           # 口语/网络用语，一行一条，可写「词=意思」
-    theme: str = "blue"            # 界面主题：blue / dark / pink / green
+    theme: str = "blue"            # 界面主题：blue / pink / green / sand（见 themes.py）
+    preset_chance: int = 30         # 每条评论走预制评论的概率（%），0 = 不用
+    meme_chance: int = 20           # 每条评论带表情包的概率（%），0 = 不用
 
     # ---- 行为与风控 ----
     daily_limit: int = 20           # 每日最多发多少条（评论 + 回复共用）
@@ -253,12 +255,16 @@ class Config:
             errors.append("temperature 要在 0 ~ 2 之间")
         if not 16 <= self.max_tokens <= 2048:
             errors.append("max_tokens 要在 16 ~ 2048 之间")
+        if not 0 <= self.preset_chance <= 100:
+            errors.append("预制评论概率要在 0 ~ 100 之间（0 = 不用）")
+        if not 0 <= self.meme_chance <= 100:
+            errors.append("表情包概率要在 0 ~ 100 之间（0 = 不用）")
         if not 1 <= self.loop_interval_min <= 1440:
             errors.append("评论间隔要在 1 ~ 1440 分钟之间")
         if not 1 <= self.reply_interval_min <= 1440:
             errors.append("消息间隔要在 1 ~ 1440 分钟之间")
-        if self.theme not in ("blue", "dark", "pink", "green"):
-            errors.append("主题只能是 blue / dark / pink / green")
+        if self.theme not in ("blue", "pink", "green", "sand"):
+            errors.append("主题只能是 blue / pink / green / sand（见 themes.py）")
         if not (self.comment_enabled or self.reply_enabled):
             errors.append("「自动评论」和「回复消息」至少要开一个")
         return errors

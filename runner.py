@@ -17,9 +17,11 @@ from typing import Callable, Optional
 
 from bilibili_api.exceptions import ApiException
 
-from bili_client import SOURCE_NAMES, BiliClient, InboxItem, dm_text
+import memes
+from bili_client import SOURCE_NAMES, BiliClient, InboxItem, VideoInfo, dm_text
 from config import Config
 from llm_client import LLMClient, LLMError
+from presets import PresetTemplate, parse_presets, pick_preset
 from risk import (
     RISK_HINT,
     FatalError,
@@ -83,6 +85,10 @@ class Runner:
         self.llm = LLMClient(cfg)
         self._next_reply_at = 0.0
         self._next_dm_at = 0.0
+        # 预制评论 / 表情包：记住上一次用的，避免连着抽到同一个
+        self._last_preset = ""
+        self._last_meme = ""
+        self._meme_warned = False
 
     # ------------------------------------------------------------------
     @property
@@ -203,12 +209,64 @@ class Runner:
                 hits.append(line)
         return "\n".join(hits)
 
-    def _presets(self) -> list[str]:
-        raw = (getattr(self.cfg, "comment_presets", "") or "").strip()
-        return [line.strip() for line in raw.splitlines() if line.strip()][:8]
+    def _preset_templates(self) -> list[PresetTemplate]:
+        return parse_presets(getattr(self.cfg, "comment_presets", "") or "")
+
+    def _pick_preset(self, info: VideoInfo) -> tuple[str, bool]:
+        """每条评论独立掷一次骰子；返回 (给模型看的预制评论文本, 是否要 @主人)。"""
+        chance = int(getattr(self.cfg, "preset_chance", 0) or 0)
+        if chance <= 0:
+            return "", False
+        template = pick_preset(self._preset_templates(), chance, avoid=self._last_preset)
+        if template is None:
+            return "", False
+        self._last_preset = template.raw
+        rendered = template.render(up_name=info.up_name, title=info.title, section=info.tname)
+        log.info("预制评论命中｜%s", rendered)
+        unknown = template.unknown_placeholders
+        if unknown:
+            log.warning("预制评论里有没认出来的占位符：%s（会原样发出去）", "、".join(unknown))
+        return rendered, template.uses_owner
+
+    def _pick_meme(self) -> Optional[memes.Meme]:
+        """按概率挑一张表情包；一张图都没有时只提醒一次。"""
+        chance = int(getattr(self.cfg, "meme_chance", 0) or 0)
+        if chance <= 0:
+            return None
+        found = memes.scan()
+        if not found:
+            if not self._meme_warned:
+                self._meme_warned = True
+                log.info("表情包概率是 %d%%，但 %s 里还没有图片，这个功能先跳过", chance, memes.ensure_dir())
+            return None
+        meme = memes.pick(found, chance, avoid=self._last_meme)
+        if meme is not None:
+            self._last_meme = str(meme.path)
+            log.info("表情包命中｜%s（情绪：%s）", meme.name, meme.tag)
+        return meme
+
+    async def _send_comment(
+        self,
+        info: VideoInfo,
+        text: str,
+        mention: Optional[tuple[str, int]] = None,
+        meme: Optional[memes.Meme] = None,
+    ) -> dict:
+        """发评论。带图失败就降级成纯文字；风控 / 封号类错误照常往上报。"""
+        if meme is None:
+            return await self.bili.post_comment(info, text, mention=mention)
+        try:
+            return await self.bili.post_comment(info, text, mention=mention, picture=meme.path)
+        except ApiException as exc:
+            if is_risk(exc) or is_fatal(exc):
+                raise
+            log.warning("带表情包发送失败（%s），这条改成纯文字再发一次", describe(exc))
+        except Exception as exc:
+            log.warning("表情包 %s 用不了（%s），这条改成纯文字", meme.name, exc)
+        return await self.bili.post_comment(info, text, mention=mention)
 
     def _apply_master_mention(self, text: str) -> tuple[str, Optional[tuple[str, int]]]:
-        """预设里写了 @主人，就换成真实昵称 + 真 @（没有主人信息时降级成「我主人」）。"""
+        """预制评论里的 @主人 换成真实昵称 + 真 @（没有主人信息时降级成「我主人」）。"""
         if "@主人" not in text:
             return text, None
         name = self.bili.master_name
@@ -217,7 +275,10 @@ class Runner:
         except ValueError:
             uid = 0
         if name and uid:
-            return text.replace("@主人", f"@{name}"), (name, uid)
+            # 昵称后面补一个空格：B站按「@昵称」匹配渲染，贴着正文容易被吃掉
+            text = text.replace("@主人", f"@{name}")
+            text = re.sub(rf"@{re.escape(name)}(?!\s)", f"@{name} ", text)
+            return re.sub(r"\s+", " ", text).strip(), (name, uid)
         return text.replace("@主人", "我主人"), None
 
     async def comment_single(self, bvid: str) -> tuple[bool, str]:
@@ -247,10 +308,14 @@ class Runner:
             except Exception as exc:
                 log.debug("拉取字幕失败：%s", exc)
 
+        preset_text, wants_owner = self._pick_preset(info)
         text = await self.llm.make_comment(
-            info, hot_comments=hot, subtitle=subtitle, presets=self._presets()
+            info, hot_comments=hot, subtitle=subtitle, preset=preset_text
         )
         text, mention = self._apply_master_mention(text)
+        if wants_owner and not mention:
+            log.warning("预制评论要求 @主人，但模型没保留 @主人，这条就不带 @ 了")
+        meme = self._pick_meme()
         log.info(
             "一键评论｜%s｜%s（参考：热评 %d 条、字幕 %d 字）→ %s",
             info.bvid,
@@ -261,9 +326,10 @@ class Runner:
         )
 
         if self.cfg.dry_run:
-            return True, f"演练模式，没有真的发送。生成的评论：\n\n{text}"
+            extra = f"\n带表情包：{meme.name}（情绪：{meme.tag}）" if meme else ""
+            return True, f"演练模式，没有真的发送。生成的评论：\n\n{text}{extra}"
 
-        await self.bili.post_comment(info, text, mention=mention)
+        await self._send_comment(info, text, mention=mention, meme=meme)
         self.store.mark_commented(info.bvid, info.aid, text)
         self.store.add_count()
         self.store.save()
@@ -378,31 +444,37 @@ class Runner:
                     except Exception as exc:
                         log.debug("拉取字幕失败：%s", exc)
 
-            # 3) 生成评论
+            # 3) 生成评论（有概率先挑一条预制评论当“路子”）
+            preset_text, wants_owner = self._pick_preset(info)
             try:
                 text = await self.llm.make_comment(
-                    info, hot_comments=hot, subtitle=subtitle, presets=self._presets()
+                    info, hot_comments=hot, subtitle=subtitle, preset=preset_text
                 )
                 text, mention = self._apply_master_mention(text)
             except LLMError as exc:
                 log.error("生成评论失败：%s", exc)
                 self.store.add_error()
                 continue
+            if wants_owner and not mention:
+                log.warning("预制评论要求 @主人，但模型没保留 @主人，这条就不带 @ 了")
+
+            meme = self._pick_meme()
 
             ctx = ""
             if hot or subtitle:
                 ctx = f"（参考：热评 {len(hot)} 条、字幕 {len(subtitle)} 字）"
             log.info("生成评论｜%s｜%s%s → %s", info.bvid, info.title[:30], ctx, text)
 
-            # 3) 发送
+            # 4) 发送
             if self.cfg.dry_run:
-                log.info("[演练] 不发送，也不写入去重记录")
+                extra = f"（本想带表情包 {meme.name}）" if meme else ""
+                log.info("[演练] 不发送，也不写入去重记录%s", extra)
                 continue
 
             if not await human_delay(self.cfg, self._stop, log.info, "发评论"):
                 return
             try:
-                res = await self.bili.post_comment(info, text, mention=mention)
+                res = await self._send_comment(info, text, mention=mention, meme=meme)
             except ApiException as exc:
                 self._handle_api_error(exc, f"评论 {v.bvid}")
                 if self.fatal_reason:
