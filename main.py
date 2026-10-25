@@ -1,7 +1,7 @@
 """程序入口。
 
     python main.py            打开界面（默认）
-    python main.py login      命令行扫码登录，Cookie 自动写进配置
+    python main.py --login    命令行扫码登录，Cookie 自动写进配置
     python main.py --cli      无界面跑一轮（看日志用）
     python main.py --cli --loop   无界面常驻
     python main.py --selftest     自检（打包后排查问题用）
